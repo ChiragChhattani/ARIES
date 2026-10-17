@@ -1,13 +1,15 @@
 # render.yaml
-# Infrastructure as Code for deploying ARIES to Render (Blueprint).
+# Free-Tier Infrastructure as Code for deploying ARIES to Render (Blueprint).
+# Compatible with Render's 100% Free Tier (No credit card / payment required).
 
 services:
   # ------------------------------------------------------------
-  # Backend API Service (FastAPI)
+  # Backend API Service (FastAPI) — Free Instance
   # ------------------------------------------------------------
   - type: web
     name: aries-backend
     runtime: python
+    plan: free
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
@@ -17,25 +19,22 @@ services:
         value: production
       - key: ARIES_LLM_PROVIDER
         value: groq
+      # Ephemeral SQLite storage for free-tier testing.
+      # NOTE: Free tier instances spin down after 15 min of inactivity, so local SQLite
+      # data will reset on spin-down or redeploy. For persistent data on the free tier,
+      # provision a free PostgreSQL database (e.g. Render Postgres, Neon, Supabase)
+      # and supply the connection string via DATABASE_URL in the Render dashboard.
       - key: ARIES_DATABASE_URL
-        value: sqlite+aiosqlite:////data/aries.db
+        value: sqlite+aiosqlite:///./aries.db
       - key: ARIES_CORS_ORIGINS
         value: "https://aries-frontend.onrender.com"
       - key: GROQ_API_KEY
-        sync: false # Set in the Render dashboard
+        sync: false # Set securely in the Render dashboard
       - key: OPENAI_API_KEY
         sync: false # Optional: set only if using OpenAI provider
-    
-    # SQLite requires a persistent disk on Render Starter instances ($0.25/GB/mo).
-    # Alternatively, for free-tier deployments, provision a Render PostgreSQL instance
-    # and provide its connection string as DATABASE_URL (auto-normalized to asyncpg).
-    disk:
-      name: aries-data
-      mountPath: /data
-      sizeGB: 1
 
   # ------------------------------------------------------------
-  # Frontend Static Site (React/Vite)
+  # Frontend Static Site (React/Vite) — Always Free on Render
   # ------------------------------------------------------------
   - type: web
     name: aries-frontend
