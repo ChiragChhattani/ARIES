@@ -1,0 +1,54 @@
+# render.yaml
+# Infrastructure as Code for deploying ARIES to Render (Blueprint).
+
+services:
+  # ------------------------------------------------------------
+  # Backend API Service (FastAPI)
+  # ------------------------------------------------------------
+  - type: web
+    name: aries-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: ARIES_ENV
+        value: production
+      - key: ARIES_LLM_PROVIDER
+        value: groq
+      - key: ARIES_DATABASE_URL
+        value: sqlite+aiosqlite:////data/aries.db
+      - key: ARIES_CORS_ORIGINS
+        value: "https://aries-frontend.onrender.com"
+      - key: GROQ_API_KEY
+        sync: false # Set in the Render dashboard
+      - key: OPENAI_API_KEY
+        sync: false # Optional: set only if using OpenAI provider
+    
+    # SQLite requires a persistent disk on Render Starter instances ($0.25/GB/mo).
+    # Alternatively, for free-tier deployments, provision a Render PostgreSQL instance
+    # and provide its connection string as DATABASE_URL (auto-normalized to asyncpg).
+    disk:
+      name: aries-data
+      mountPath: /data
+      sizeGB: 1
+
+  # ------------------------------------------------------------
+  # Frontend Static Site (React/Vite)
+  # ------------------------------------------------------------
+  - type: web
+    name: aries-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_URL
+        value: "https://aries-backend.onrender.com/api/v1"
+    
+    # SPA rewrite rule so direct route links (/interview/:id, /report/:id) serve index.html
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

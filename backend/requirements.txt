@@ -1,0 +1,43 @@
+# === ARIES Backend Dependencies ===
+# Pin exact versions for reproducible builds.
+# Update versions deliberately, not automatically.
+
+# --- Web Framework ---
+fastapi==0.115.12
+uvicorn[standard]==0.34.3
+websockets==15.0.1
+
+# --- Data Validation ---
+pydantic==2.11.3
+pydantic-settings==2.9.1
+
+# --- Database ---
+sqlalchemy==2.0.41
+aiosqlite==0.21.0
+asyncpg>=0.30.0
+
+# --- Agent Orchestration (AutoGen 0.7.x family) ---
+autogen-agentchat==0.7.5
+autogen-ext[openai]==0.7.5
+
+# --- OpenAI ---
+# NOTE: openai version is managed by autogen-ext[openai] (requires >=1.93).
+# Do NOT pin openai separately — it would conflict with autogen-ext.
+
+# --- Groq ---
+# Pure-Python SDK for Groq API. Used directly (bypassing openai/jiter) when
+# ARIES_LLM_PROVIDER=groq. Required on Windows where jiter.pyd may be blocked
+# by Application Control policies.
+groq>=1.7.0
+
+# --- HTTP Client (for async operations) ---
+httpx==0.28.1
+
+# --- Testing ---
+pytest==8.3.5
+pytest-asyncio==0.25.3
+pytest-cov==6.1.1
+
+# --- Utilities ---
+python-dotenv==1.1.0
+python-multipart==0.0.20

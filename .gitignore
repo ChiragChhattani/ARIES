@@ -1,0 +1,41 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+
+# === Virtual Environment ===
+.venv/
+venv/
+env/
+
+# === Environment & Secrets ===
+.env
+.env.*
+!.env.example
+*.env.local
+
+# === Database ===
+*.db
+*.sqlite
+*.sqlite3
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === Node / Frontend ===
+node_modules/
+frontend/dist/
+
+# === OS ===
+.DS_Store
+Thumbs.db
