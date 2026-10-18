@@ -85,6 +85,7 @@ class InterviewerAgentAdapter:
                     user_message=task_prompt,
                     output_model=NextQuestion,
                     temperature=0.7,
+                    max_tokens=1024,
                 )
             else:
                 result = await self._agent.run(task=task_prompt)

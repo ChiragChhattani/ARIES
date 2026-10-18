@@ -93,7 +93,9 @@ class InterviewOrchestrator:
         
         return await self.repo.save(session)
         
-    async def handle_candidate_answer(self, session_id: str, answer_text: str) -> InterviewSession:
+    async def handle_candidate_answer(
+        self, session_id: str, answer_text: str, client_last_question: str | None = None
+    ) -> InterviewSession:
         """Processes a candidate's answer and generates the next move."""
         
         session = await self.repo.get_by_id(session_id)
@@ -107,6 +109,26 @@ class InterviewOrchestrator:
         cleaned_answer = answer_text.strip() if answer_text else ""
         if not cleaned_answer:
             raise OrchestratorError("Candidate answer cannot be empty or whitespace.")
+
+        # Guard against duplicate submission during disconnect / fallback:
+        # If client specifies the question it was answering, check if the session has
+        # already moved past it (e.g. earlier WebSocket request succeeded before disconnect).
+        if client_last_question:
+            current_q = None
+            for entry in reversed(session.transcript):
+                if entry.speaker == "interviewer":
+                    current_q = entry.content
+                    break
+            if current_q and current_q.strip() != client_last_question.strip():
+                logger.info(
+                    f"Idempotent answer skipped for session {session_id}: "
+                    f"client answered '{client_last_question[:40]}...', but session is at '{current_q[:40]}...'"
+                )
+                return session
+
+        # Prevent duplicate candidate turn while previous turn is still pending
+        if session.transcript and session.transcript[-1].speaker == "candidate":
+            raise StateMachineError("A candidate answer has already been submitted and is currently being processed.")
 
         # 1. Save candidate answer
         session.transcript.append(

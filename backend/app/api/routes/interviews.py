@@ -198,6 +198,56 @@ async def evaluate_interview(session_id: str, db: AsyncSession = Depends(get_db_
         raise HTTPException(status_code=500, detail={"code": "SERVER_ERROR", "message": "The interview could not be evaluated. Please try again."})
 
 from app.schemas.interview import ProctoringEvent
+from pydantic import BaseModel, Field
+
+class AnswerSubmitRequest(BaseModel):
+    answer: str = Field(..., description="Candidate's answer text")
+    last_question: str | None = Field(None, description="The question text the candidate was answering (for idempotency)")
+
+@router.post("/{session_id}/answer", response_model=InterviewResponse)
+async def submit_candidate_answer(
+    session_id: str,
+    request: AnswerSubmitRequest,
+    db: AsyncSession = Depends(get_db_session)
+):
+    """
+    HTTP REST endpoint for submitting candidate answers.
+    Provides a reliable fallback if WebSockets disconnect or fail.
+    """
+    orchestrator = InterviewOrchestrator(db)
+    try:
+        session = await orchestrator.handle_candidate_answer(
+            session_id, request.answer, client_last_question=request.last_question
+        )
+        last_entry = session.transcript[-1]
+
+        if session.status == "COMPLETED":
+            await manager.send_event(session_id, WebSocketEventType.INTERVIEW_COMPLETED, {"conclusion": last_entry.content})
+        else:
+            await manager.send_event(session_id, WebSocketEventType.QUESTION_GENERATED, {"question": last_entry.content})
+
+        await manager.send_event(session_id, WebSocketEventType.STATUS_UPDATED, {"status": session.status})
+        return _to_response(session)
+    except StateMachineError as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"StateMachineError in submit_candidate_answer [correlation_id={corr_id}]: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": str(e)})
+    except OrchestratorError as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"OrchestratorError in submit_candidate_answer [correlation_id={corr_id}]: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail={"code": "ORCHESTRATOR_ERROR", "message": str(e)})
+    except (openai.AuthenticationError, groq.AuthenticationError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Auth Error in submit_candidate_answer [correlation_id={corr_id}]: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail={"code": "AI_NOT_CONFIGURED", "message": "The AI service is not configured."})
+    except (openai.RateLimitError, groq.RateLimitError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Rate Limit in submit_candidate_answer [correlation_id={corr_id}]: {e}", exc_info=True)
+        raise HTTPException(status_code=429, detail={"code": "AI_RATE_LIMIT", "message": "AI rate limit exceeded. Please try again shortly."})
+    except Exception as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"Server Error in submit_candidate_answer [correlation_id={corr_id}]: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail={"code": "SERVER_ERROR", "message": "Internal error processing answer."})
 
 @router.post("/{session_id}/events", response_model=dict)
 async def log_proctoring_event(
@@ -205,14 +255,11 @@ async def log_proctoring_event(
     event: ProctoringEvent, 
     db: AsyncSession = Depends(get_db_session)
 ):
-    """Log a proctoring or anti-cheating event from the client."""
+    """Log a proctoring or anti-cheating event from the client atomically."""
     orchestrator = InterviewOrchestrator(db)
-    session = await orchestrator.repo.get_by_id(session_id)
-    if not session:
+    success = await orchestrator.repo.add_proctoring_event(session_id, event)
+    if not success:
         raise HTTPException(status_code=404, detail="Interview not found")
-    
-    session.proctoring_events.append(event)
-    await orchestrator.repo.save(session)
     return {"status": "logged"}
 
 
@@ -236,6 +283,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, db: AsyncSes
             
             if payload.get("type") == "submit_answer":
                 answer_text = payload.get("answer")
+                last_question = payload.get("last_question")
                 
                 # Notify UI we are processing
                 await manager.send_event(session_id, WebSocketEventType.PROCESSING_STARTED, {})
@@ -243,7 +291,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, db: AsyncSes
                 # Call orchestrator
                 orchestrator = InterviewOrchestrator(db)
                 try:
-                    session = await orchestrator.handle_candidate_answer(session_id, answer_text)
+                    session = await orchestrator.handle_candidate_answer(
+                        session_id, answer_text, client_last_question=last_question
+                    )
                     
                     # Look at the last entry in the transcript
                     last_entry = session.transcript[-1]
@@ -260,13 +310,30 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, db: AsyncSes
                     await db.commit()
                     
                 except StateMachineError as e:
-                    await manager.send_event(session_id, WebSocketEventType.ERROR, {"message": str(e)})
+                    corr_id = correlation_id_var.get()
+                    logger.error(f"StateMachineError in websocket {session_id} [correlation_id={corr_id}]: {e}")
+                    await manager.send_event(session_id, WebSocketEventType.ERROR, {"message": str(e), "code": "INVALID_STATE"})
                     await db.rollback()
                 except OrchestratorError as e:
-                    await manager.send_event(session_id, WebSocketEventType.ERROR, {"message": str(e)})
+                    corr_id = correlation_id_var.get()
+                    logger.error(f"OrchestratorError in websocket {session_id} [correlation_id={corr_id}]: {e}")
+                    await manager.send_event(session_id, WebSocketEventType.ERROR, {"message": str(e), "code": "ORCHESTRATOR_ERROR"})
+                    await db.rollback()
+                except (openai.RateLimitError, groq.RateLimitError) as e:
+                    corr_id = correlation_id_var.get()
+                    logger.error(f"Rate limit in websocket {session_id} [correlation_id={corr_id}]: {e}")
+                    await manager.send_event(session_id, WebSocketEventType.ERROR, {
+                        "message": "AI service rate limit reached. Please wait a moment and try resubmitting.",
+                        "code": "AI_RATE_LIMIT"
+                    })
                     await db.rollback()
                 except Exception as e:
-                    await manager.send_event(session_id, WebSocketEventType.ERROR, {"message": "Internal processing error"})
+                    corr_id = correlation_id_var.get()
+                    logger.error(f"WebSocket processing error {session_id} [correlation_id={corr_id}]: {e}", exc_info=True)
+                    await manager.send_event(session_id, WebSocketEventType.ERROR, {
+                        "message": "An error occurred while generating the next question. Please try resubmitting your answer.",
+                        "code": "SERVER_ERROR"
+                    })
                     await db.rollback()
                     
     except WebSocketDisconnect:

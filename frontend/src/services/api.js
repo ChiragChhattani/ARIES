@@ -121,3 +121,21 @@ export async function logProctoringEvent(sessionId, eventType, details = "") {
   }
   return res.json();
 }
+
+export async function submitAnswerRest(sessionId, answerText, lastQuestion = null) {
+  const payload = { answer: answerText };
+  if (lastQuestion) payload.last_question = lastQuestion;
+  const res = await fetch(`${API_BASE}/interviews/${sessionId}/answer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    const err = new Error(errorData.detail?.message || "Failed to submit answer");
+    err.status = res.status;
+    err.code = errorData.detail?.code;
+    throw err;
+  }
+  return res.json();
+}

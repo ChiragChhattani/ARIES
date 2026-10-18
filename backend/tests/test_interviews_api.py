@@ -268,3 +268,168 @@ class TestInterviewsApi:
         assert start_res.status_code == 502
         data = start_res.json()
         assert data["detail"]["code"] == "AI_MODEL_NOT_FOUND"
+
+    def test_submit_answer_rest_endpoint_success(self, test_client, monkeypatch):
+        """POST /api/v1/interviews/{session_id}/answer submits an answer and returns next question."""
+        res = test_client.post("/api/v1/interviews", json={
+            "job_description": {
+                "field": "software_engineering",
+                "custom_field_name": "",
+                "title": "Backend Dev",
+                "description": "A" * 60,
+                "competencies": [{"name": "Python", "description": "Python knowledge"}]
+            }
+        })
+        session_id = res.json()["session_id"]
+
+        from app.schemas.agent_outputs import NextQuestion
+        from unittest.mock import AsyncMock
+
+        mock_q1 = NextQuestion(
+            question_text="Q1: Tell me about Python.",
+            rationale="Rationale 1",
+            competency_targeted="Python",
+            is_followup=False,
+            expected_good_answer_elements=["basics"]
+        )
+        monkeypatch.setattr(
+            "app.agents.interviewer.InterviewerAgentAdapter.generate_next_question",
+            AsyncMock(return_value=mock_q1)
+        )
+        test_client.post(f"/api/v1/interviews/{session_id}/start")
+
+        # Now submit answer via REST
+        mock_q2 = NextQuestion(
+            question_text="Q2: How do generators work?",
+            rationale="Rationale 2",
+            competency_targeted="Python",
+            is_followup=False,
+            expected_good_answer_elements=["yield"]
+        )
+        monkeypatch.setattr(
+            "app.agents.interviewer.InterviewerAgentAdapter.generate_next_question",
+            AsyncMock(return_value=mock_q2)
+        )
+
+        ans_res = test_client.post(f"/api/v1/interviews/{session_id}/answer", json={
+            "answer": "Python is a dynamic interpreted language with clean syntax."
+        })
+        assert ans_res.status_code == 200
+        data = ans_res.json()
+        assert data["questions_asked"] == 2
+        assert len(data["transcript"]) == 3  # Q1, A1, Q2
+        assert data["transcript"][1]["content"] == "Python is a dynamic interpreted language with clean syntax."
+        assert data["transcript"][2]["content"] == "Q2: How do generators work?"
+
+    def test_submit_empty_answer_rejected(self, test_client, monkeypatch):
+        """Empty or whitespace-only answer returns 400."""
+        res = test_client.post("/api/v1/interviews", json={
+            "job_description": {
+                "field": "software_engineering",
+                "custom_field_name": "",
+                "title": "Backend Dev",
+                "description": "A" * 60,
+                "competencies": [{"name": "Python", "description": "Python knowledge"}]
+            }
+        })
+        session_id = res.json()["session_id"]
+
+        from app.schemas.agent_outputs import NextQuestion
+        from unittest.mock import AsyncMock
+
+        mock_q = NextQuestion(
+            question_text="Q1",
+            rationale="R1",
+            competency_targeted="Python",
+            is_followup=False,
+            expected_good_answer_elements=["a"]
+        )
+        monkeypatch.setattr(
+            "app.agents.interviewer.InterviewerAgentAdapter.generate_next_question",
+            AsyncMock(return_value=mock_q)
+        )
+        test_client.post(f"/api/v1/interviews/{session_id}/start")
+
+        # Empty answer
+        ans_res = test_client.post(f"/api/v1/interviews/{session_id}/answer", json={"answer": "   "})
+        assert ans_res.status_code == 400
+        assert ans_res.json()["detail"]["code"] == "ORCHESTRATOR_ERROR"
+
+    def test_log_proctoring_event_api(self, test_client):
+        """POST /api/v1/interviews/{session_id}/events logs events atomically."""
+        res = test_client.post("/api/v1/interviews", json={
+            "job_description": {
+                "field": "software_engineering",
+                "custom_field_name": "",
+                "title": "Backend Dev",
+                "description": "A" * 60,
+                "competencies": [{"name": "Python", "description": "Python knowledge"}]
+            }
+        })
+        session_id = res.json()["session_id"]
+
+        ev_res = test_client.post(f"/api/v1/interviews/{session_id}/events", json={
+            "event_type": "tab_switch",
+            "details": "User switched tabs"
+        })
+        assert ev_res.status_code == 200
+        assert ev_res.json() == {"status": "logged"}
+
+        # Verify event appears in session
+        get_res = test_client.get(f"/api/v1/interviews/{session_id}")
+        assert get_res.status_code == 200
+        events = get_res.json()["proctoring_events"]
+        assert len(events) == 1
+        assert events[0]["event_type"] == "tab_switch"
+
+    def test_submit_answer_rest_idempotent_with_last_question(self, test_client, monkeypatch):
+        """Resubmitting an answer with last_question for an already-advanced question is idempotent."""
+        res = test_client.post("/api/v1/interviews", json={
+            "job_description": {
+                "field": "software_engineering",
+                "custom_field_name": "",
+                "title": "Backend Dev",
+                "description": "A" * 60,
+                "competencies": [{"name": "Python", "description": "Python knowledge"}]
+            }
+        })
+        session_id = res.json()["session_id"]
+
+        from app.schemas.agent_outputs import NextQuestion
+        from unittest.mock import AsyncMock
+
+        mock_q1 = NextQuestion(
+            question_text="Q1: Tell me about Python.",
+            rationale="R1", competency_targeted="Python", is_followup=False,
+            expected_good_answer_elements=["basics"]
+        )
+        mock_q2 = NextQuestion(
+            question_text="Q2: What is asyncio?",
+            rationale="R2", competency_targeted="Python", is_followup=False,
+            expected_good_answer_elements=["event loop"]
+        )
+        monkeypatch.setattr(
+            "app.agents.interviewer.InterviewerAgentAdapter.generate_next_question",
+            AsyncMock(side_effect=[mock_q1, mock_q2])
+        )
+        test_client.post(f"/api/v1/interviews/{session_id}/start")
+
+        # Submit answer to Q1
+        first_res = test_client.post(f"/api/v1/interviews/{session_id}/answer", json={
+            "answer": "I have 5 years experience.",
+            "last_question": "Q1: Tell me about Python."
+        })
+        assert first_res.status_code == 200
+        assert first_res.json()["questions_asked"] == 2
+        assert len(first_res.json()["transcript"]) == 3
+
+        # Resubmit duplicate answer to Q1 (e.g. client fallback / retry)
+        dup_res = test_client.post(f"/api/v1/interviews/{session_id}/answer", json={
+            "answer": "I have 5 years experience.",
+            "last_question": "Q1: Tell me about Python."
+        })
+        assert dup_res.status_code == 200
+        # Transcript and question count must NOT increase
+        assert dup_res.json()["questions_asked"] == 2
+        assert len(dup_res.json()["transcript"]) == 3
+        assert dup_res.json()["transcript"][-1]["content"] == "Q2: What is asyncio?"

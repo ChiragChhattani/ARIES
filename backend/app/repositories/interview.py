@@ -87,6 +87,24 @@ class InterviewRepository:
             
         await self.db.flush() # Send SQL to DB but don't commit yet (let route handler commit)
         return session
+
+    async def add_proctoring_event(self, session_id: str, event: ProctoringEvent) -> bool:
+        """
+        Atomically append a proctoring event without modifying session transcript or questions.
+        Prevents race conditions between concurrent proctoring logs and interview dialogue.
+        """
+        stmt = select(InterviewRecord).where(InterviewRecord.session_id == session_id)
+        result = await self.db.execute(stmt)
+        record = result.scalar_one_or_none()
+        if not record:
+            return False
+
+        event_dict = event.model_dump(mode="json") if hasattr(event, "model_dump") else event
+        events = list(record.proctoring_events or [])
+        events.append(event_dict)
+        record.proctoring_events = events
+        await self.db.flush()
+        return True
         
     def _to_pydantic(self, record: InterviewRecord) -> InterviewSession:
         """Convert SQLAlchemy model back to Pydantic domain model."""

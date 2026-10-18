@@ -12,7 +12,7 @@ from unittest.mock import patch, AsyncMock
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from app.database.models import Base
-from app.schemas.interview import InterviewCreateRequest, InterviewSettings, ProctoringEvent
+from app.schemas.interview import InterviewCreateRequest, InterviewSettings, ProctoringEvent, TranscriptEntry
 from app.schemas.job import JobDescription, Competency
 from app.schemas.common import InterviewStatus, ProctoringEventType
 from app.orchestration.orchestrator import InterviewOrchestrator, OrchestratorError
@@ -367,3 +367,268 @@ async def test_proctoring_events_survive_evaluation_and_report_retrieval(db_sess
     assert final_session.evaluation_report is not None
 
 
+@pytest.mark.asyncio
+async def test_interview_continuation_through_five_question_limit(db_session):
+    """
+    Regression test: Verifies that the interview progresses through all 5 questions
+    with normal answers, short answers, and 'I don't know', terminating only when
+    the 5-question limit is reached.
+    """
+    from app.schemas.job import InterviewField
+    orchestrator = InterviewOrchestrator(db_session)
+    request = InterviewCreateRequest(
+        job_description=JobDescription(
+            title="Software Engineer",
+            field=InterviewField.SOFTWARE_ENGINEERING,
+            description="A" * 60,
+            competencies=[
+                Competency(name="Data Structures", description="Arrays, maps, trees"),
+                Competency(name="Algorithms", description="Sorting, searching"),
+                Competency(name="System Design", description="Distributed systems"),
+            ]
+        ),
+        settings=InterviewSettings(max_questions=5),
+        candidate_identifier="Test Candidate"
+    )
+    session = await orchestrator.create_interview(request)
+    assert session.status == InterviewStatus.CONFIGURED
+
+    # Q1
+    q1 = NextQuestion(
+        question_text="Explain how hash tables handle collisions.",
+        rationale="Assess hash table internals",
+        competency_targeted="Data Structures",
+        is_followup=False,
+        expected_good_answer_elements=["chaining", "open addressing"]
+    )
+    with patch('app.agents.interviewer.InterviewerAgentAdapter.generate_next_question', new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = q1
+        session = await orchestrator.start_interview(session.session_id)
+
+    assert session.status == InterviewStatus.IN_PROGRESS
+    assert session.questions_asked == 1
+    assert len(session.transcript) == 1
+
+    # Turn 1: Normal answer -> generates Q2
+    q2 = NextQuestion(
+        question_text="What is the time complexity of quicksort in the worst case?",
+        rationale="Assess sorting algorithms",
+        competency_targeted="Algorithms",
+        is_followup=False,
+        expected_good_answer_elements=["O(n^2)", "pivot selection"]
+    )
+    with patch('app.agents.interviewer.InterviewerAgentAdapter.generate_next_question', new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = q2
+        session = await orchestrator.handle_candidate_answer(
+            session.session_id,
+            "Hash tables use chaining with linked lists or open addressing with linear probing to resolve collisions."
+        )
+
+    assert session.status == InterviewStatus.IN_PROGRESS
+    assert session.questions_asked == 2
+    assert len(session.transcript) == 3
+
+    # Turn 2: Short answer ("Yes, O(n log n) average.") -> generates Q3
+    q3 = NextQuestion(
+        question_text="How would you design a rate limiter for an API?",
+        rationale="Assess system design",
+        competency_targeted="System Design",
+        is_followup=False,
+        expected_good_answer_elements=["token bucket", "Redis"]
+    )
+    with patch('app.agents.interviewer.InterviewerAgentAdapter.generate_next_question', new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = q3
+        session = await orchestrator.handle_candidate_answer(
+            session.session_id,
+            "Worst case is O(n^2), average is O(n log n)."
+        )
+
+    assert session.status == InterviewStatus.IN_PROGRESS
+    assert session.questions_asked == 3
+    assert len(session.transcript) == 5
+
+    # Turn 3: "I don't know" answer -> does NOT stop interview, moves to Q4
+    q4 = NextQuestion(
+        question_text="Can you explain the difference between a process and a thread?",
+        rationale="Assess OS fundamentals",
+        competency_targeted="Data Structures",
+        is_followup=False,
+        expected_good_answer_elements=["shared memory", "isolation"]
+    )
+    with patch('app.agents.interviewer.InterviewerAgentAdapter.generate_next_question', new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = q4
+        session = await orchestrator.handle_candidate_answer(
+            session.session_id,
+            "I don't know"
+        )
+
+    assert session.status == InterviewStatus.IN_PROGRESS
+    assert session.questions_asked == 4
+    assert len(session.transcript) == 7
+
+    # Turn 4: Normal answer -> generates Q5 (5th main question)
+    q5 = NextQuestion(
+        question_text="What are database indexes and how do B-trees work?",
+        rationale="Assess database indexing",
+        competency_targeted="System Design",
+        is_followup=False,
+        expected_good_answer_elements=["B-tree", "lookup speed"]
+    )
+    with patch('app.agents.interviewer.InterviewerAgentAdapter.generate_next_question', new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = q5
+        session = await orchestrator.handle_candidate_answer(
+            session.session_id,
+            "A process has its own address space, while threads share the process memory."
+        )
+
+    assert session.status == InterviewStatus.IN_PROGRESS
+    assert session.questions_asked == 5
+    assert len(session.transcript) == 9
+
+    # Turn 5: 5th answer submitted -> interview terminates at max_questions=5 limit
+    session = await orchestrator.handle_candidate_answer(
+        session.session_id,
+        "Indexes speed up reads using balanced search trees like B+ trees."
+    )
+
+    assert session.status == InterviewStatus.COMPLETED
+    assert session.questions_asked == 5
+    # Transcript has 10 entries: Q1, A1, Q2, A2, Q3, A3, Q4, A4, Q5, A5 + conclusion = 11 entries
+    assert len(session.transcript) == 11
+    assert session.transcript[-1].speaker == "interviewer"
+    assert "conclude" in session.transcript[-1].content.lower()
+
+
+@pytest.mark.asyncio
+async def test_tab_switch_proctoring_event_does_not_block_or_terminate_interview(db_session, create_request):
+    """
+    Verifies that logging tab-switch or window-blur events does not stop question generation,
+    does not terminate the interview prematurely, and does not corrupt transcript data.
+    """
+    orchestrator = InterviewOrchestrator(db_session)
+    session = await orchestrator.create_interview(create_request)
+
+    q1 = NextQuestion(
+        question_text="Q1", rationale="R1", competency_targeted="Python",
+        is_followup=False, expected_good_answer_elements=["A"]
+    )
+    with patch('app.agents.interviewer.InterviewerAgentAdapter.generate_next_question', new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = q1
+        session = await orchestrator.start_interview(session.session_id)
+
+    # Candidate switches tabs while reading Q1
+    tab_event = ProctoringEvent(
+        event_type=ProctoringEventType.tab_switch,
+        details="document.visibilityState became hidden (tab switched)"
+    )
+    added = await orchestrator.repo.add_proctoring_event(session.session_id, tab_event)
+    assert added is True
+
+    # Interview must remain IN_PROGRESS
+    reloaded = await orchestrator.repo.get_by_id(session.session_id)
+    assert reloaded.status == InterviewStatus.IN_PROGRESS
+    assert reloaded.questions_asked == 1
+    assert len(reloaded.transcript) == 1
+    assert len(reloaded.proctoring_events) == 1
+
+    # Candidate returns and submits answer 1
+    q2 = NextQuestion(
+        question_text="Q2", rationale="R2", competency_targeted="Python",
+        is_followup=False, expected_good_answer_elements=["B"]
+    )
+    with patch('app.agents.interviewer.InterviewerAgentAdapter.generate_next_question', new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = q2
+        session = await orchestrator.handle_candidate_answer(session.session_id, "Answer 1 after tab switch")
+
+    assert session.status == InterviewStatus.IN_PROGRESS
+    assert session.questions_asked == 2
+    assert len(session.transcript) == 3
+
+    # Candidate triggers window blur
+    blur_event = ProctoringEvent(
+        event_type=ProctoringEventType.window_blur,
+        details="Window lost focus"
+    )
+    await orchestrator.repo.add_proctoring_event(session.session_id, blur_event)
+
+    # Candidate submits answer 2
+    q3 = NextQuestion(
+        question_text="Q3", rationale="R3", competency_targeted="Python",
+        is_followup=False, expected_good_answer_elements=["C"]
+    )
+    with patch('app.agents.interviewer.InterviewerAgentAdapter.generate_next_question', new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = q3
+        session = await orchestrator.handle_candidate_answer(session.session_id, "Answer 2")
+
+    assert session.status == InterviewStatus.IN_PROGRESS
+    assert session.questions_asked == 3
+
+    # Final DB check: both proctoring events logged, all questions intact
+    final_session = await orchestrator.repo.get_by_id(session.session_id)
+    assert len(final_session.proctoring_events) == 2
+    assert len(final_session.transcript) == 5
+
+
+@pytest.mark.asyncio
+async def test_idempotent_answer_does_not_advance_or_duplicate(db_session, create_request):
+    """Test that submitting an answer for an already-answered question (during disconnect/fallback) is idempotent."""
+    orchestrator = InterviewOrchestrator(db_session)
+    session = await orchestrator.create_interview(create_request)
+
+    q1 = NextQuestion(
+        question_text="What is Python?", rationale="R1", competency_targeted="Python",
+        is_followup=False, expected_good_answer_elements=["Language"]
+    )
+    with patch('app.agents.interviewer.InterviewerAgentAdapter.generate_next_question', new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = q1
+        session = await orchestrator.start_interview(session.session_id)
+
+    # Turn 1: Process answer for Q1 -> advances to Q2
+    q2 = NextQuestion(
+        question_text="What is asyncio?", rationale="R2", competency_targeted="Python",
+        is_followup=False, expected_good_answer_elements=["Event loop"]
+    )
+    with patch('app.agents.interviewer.InterviewerAgentAdapter.generate_next_question', new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = q2
+        session = await orchestrator.handle_candidate_answer(
+            session.session_id, "Python is a language", client_last_question="What is Python?"
+        )
+
+    assert session.questions_asked == 2
+    assert len(session.transcript) == 3
+    assert session.transcript[-1].content == "What is asyncio?"
+
+    # Fallback/retry arrives with answer to Q1 again (client_last_question="What is Python?")
+    idempotent_session = await orchestrator.handle_candidate_answer(
+        session.session_id, "Python is a language", client_last_question="What is Python?"
+    )
+
+    # MUST NOT advance to Q3, MUST NOT add another transcript entry
+    assert idempotent_session.questions_asked == 2
+    assert len(idempotent_session.transcript) == 3
+    assert idempotent_session.transcript[-1].content == "What is asyncio?"
+
+
+@pytest.mark.asyncio
+async def test_consecutive_candidate_answers_rejected(db_session, create_request):
+    """Test that submitting a candidate answer when previous candidate answer is already pending raises StateMachineError."""
+    orchestrator = InterviewOrchestrator(db_session)
+    session = await orchestrator.create_interview(create_request)
+
+    q1 = NextQuestion(
+        question_text="What is Python?", rationale="R1", competency_targeted="Python",
+        is_followup=False, expected_good_answer_elements=["Language"]
+    )
+    with patch('app.agents.interviewer.InterviewerAgentAdapter.generate_next_question', new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = q1
+        session = await orchestrator.start_interview(session.session_id)
+
+    # Artificially simulate an uncompleted turn where candidate answer is in transcript
+    session.transcript.append(
+        TranscriptEntry(speaker="candidate", content="First answer", stage=session.current_stage)
+    )
+    await orchestrator.repo.save(session)
+
+    # Submitting another answer while speaker is still candidate should be blocked
+    with pytest.raises(StateMachineError, match="already been submitted"):
+        await orchestrator.handle_candidate_answer(session.session_id, "Second answer")

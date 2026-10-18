@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { getInterview, startInterview, evaluateInterview, logProctoringEvent } from "../services/api";
+import { getInterview, startInterview, evaluateInterview, logProctoringEvent, submitAnswerRest } from "../services/api";
 import { InterviewSocket } from "../services/socket";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -174,6 +174,7 @@ export default function LiveInterview() {
   const sessionIdRef = useRef(id);
   sessionIdRef.current = id;
   const lastCopyPasteLogRef = useRef(0);
+  const pendingAnswerRef = useRef(null);
 
   // ── Record a proctoring event locally and send to backend ────────────────
   const recordEvent = useCallback(async (eventType, details = "") => {
@@ -415,15 +416,31 @@ export default function LiveInterview() {
           if (eventType === "question_generated") {
             setTranscript(prev => [...prev, { speaker: "interviewer", content: payload.question }]);
             setIsProcessing(false);
+            pendingAnswerRef.current = null;
           } else if (eventType === "interview_completed") {
             setTranscript(prev => [...prev, { speaker: "interviewer", content: payload.conclusion }]);
             setIsProcessing(false);
             setSession(prev => ({ ...prev, status: "COMPLETED" }));
+            pendingAnswerRef.current = null;
           } else if (eventType === "processing_started") {
             setIsProcessing(true);
           } else if (eventType === "status_updated") {
             setSession(prev => ({ ...prev, status: payload.status }));
             if (payload.status === "REPORT_READY") navigate(`/report/${id}`);
+          } else if (eventType === "error") {
+            setIsProcessing(false);
+            if (pendingAnswerRef.current) {
+              const failedAnswer = pendingAnswerRef.current;
+              setTranscript(prev => {
+                if (prev.length > 0 && prev[prev.length - 1].speaker === "candidate" && prev[prev.length - 1].content === failedAnswer) {
+                  return prev.slice(0, -1);
+                }
+                return prev;
+              });
+              setInput(failedAnswer);
+              pendingAnswerRef.current = null;
+            }
+            setToast(`⚠ ${payload?.message || "An error occurred generating the next question. Your answer was preserved — please try submitting again."}`);
           }
         });
         ws.connect();
@@ -486,12 +503,56 @@ export default function LiveInterview() {
     }
   }
 
-  function submitAnswer(e) {
+  async function doRestSubmit(answerText, lastQuestion) {
+    try {
+      const updated = await submitAnswerRest(id, answerText, lastQuestion);
+      if (updated?.transcript?.length > 0) {
+        setTranscript(updated.transcript);
+        setInput("");
+        setIsProcessing(false);
+        pendingAnswerRef.current = null;
+        if (updated.status === "COMPLETED") {
+          setSession(prev => ({ ...prev, status: "COMPLETED" }));
+        }
+      }
+    } catch (err) {
+      setIsProcessing(false);
+      // Remove optimistic candidate entry if present so it's not permanently appended
+      setTranscript(prev => {
+        if (prev.length > 0 && prev[prev.length - 1].speaker === "candidate" && prev[prev.length - 1].content === answerText) {
+          return prev.slice(0, -1);
+        }
+        return prev;
+      });
+      // Preserve the user's answer in input field for easy retry
+      setInput(answerText);
+      pendingAnswerRef.current = null;
+      setToast(`⚠ ${err.message || "Failed to submit answer. Your text has been preserved. Please try again."}`);
+    }
+  }
+
+  async function submitAnswer(e) {
     e.preventDefault();
-    if (!input.trim() || isProcessing) return;
-    setTranscript(prev => [...prev, { speaker: "candidate", content: input }]);
-    socket.submitAnswer(input);
-    setInput("");
+    const answerText = input.trim();
+    if (!answerText || isProcessing) return;
+
+    const lastQuestion = [...transcript].reverse().find(t => t.speaker === "interviewer")?.content || null;
+    setIsProcessing(true);
+
+    if (socket && socket.isOpen()) {
+      pendingAnswerRef.current = answerText;
+      // Optimistically show candidate answer in transcript
+      setTranscript(prev => [...prev, { speaker: "candidate", content: answerText }]);
+      setInput("");
+      const sent = socket.submitAnswer(answerText, lastQuestion);
+      if (!sent) {
+        // Fallback to REST immediately if socket send failed
+        await doRestSubmit(answerText, lastQuestion);
+      }
+    } else {
+      // WebSocket not open: submit via REST fallback
+      await doRestSubmit(answerText, lastQuestion);
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────

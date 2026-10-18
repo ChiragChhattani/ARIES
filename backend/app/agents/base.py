@@ -18,6 +18,7 @@ Both paths return structured Pydantic objects; callers use `parse_json_safely`
 to convert the raw JSON string Groq returns.
 """
 
+import asyncio
 from typing import TypeVar, Type
 from pydantic import BaseModel
 import json
@@ -96,15 +97,21 @@ async def groq_generate(
     user_message: str,
     output_model: Type[T],
     temperature: float = 0.7,
+    max_tokens: int | None = None,
+    max_retries: int = 3,
 ) -> T:
     """
     Call Groq directly and return a parsed Pydantic object.
+    Includes retry logic with backoff for rate limits and connection issues,
+    and fallback model selection for missing models.
 
     Args:
         system_prompt: The agent's system message (should already contain JSON schema instruction).
         user_message: The user/task message.
         output_model: Pydantic model to parse the response into.
         temperature: Sampling temperature.
+        max_tokens: Maximum tokens for response (defaults to 1024 to respect TPM budgets).
+        max_retries: Number of retries on 429 rate limit or connection error.
 
     Returns:
         A validated instance of `output_model`.
@@ -113,36 +120,55 @@ async def groq_generate(
     settings = get_settings()
     client = create_groq_client()
     target_model = settings.groq_model or "openai/gpt-oss-120b"
+    token_limit = max_tokens if max_tokens is not None else min(settings.openai_max_tokens, 1024)
 
-    try:
-        response = await client.chat.completions.create(
-            model=target_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            response_format={"type": "json_object"},
-            temperature=temperature,
-            max_tokens=settings.openai_max_tokens,
-        )
-    except groq.NotFoundError as err:
-        logger.warning(f"Groq model '{target_model}' not found. Falling back to alternative model: {err}")
-        fallback_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
-        fallback_model = next((m for m in fallback_models if m != target_model), "openai/gpt-oss-20b")
-        response = await client.chat.completions.create(
-            model=fallback_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            response_format={"type": "json_object"},
-            temperature=temperature,
-            max_tokens=settings.openai_max_tokens,
-        )
+    retries = 0
+    backoff = 2.0
+    model_fallback_attempted = False
 
-    raw = response.choices[0].message.content
-    logger.debug(f"Groq raw response (first 300 chars): {raw[:300]}")
-    return parse_json_safely(raw, output_model)
+    while True:
+        try:
+            response = await client.chat.completions.create(
+                model=target_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                response_format={"type": "json_object"},
+                temperature=temperature,
+                max_tokens=token_limit,
+            )
+            raw = response.choices[0].message.content
+            logger.debug(f"Groq raw response (first 300 chars): {raw[:300]}")
+            return parse_json_safely(raw, output_model)
+        except groq.NotFoundError as err:
+            if model_fallback_attempted:
+                logger.error(f"Fallback Groq model '{target_model}' also not found: {err}")
+                raise
+            model_fallback_attempted = True
+            logger.warning(f"Groq model '{target_model}' not found. Falling back to alternative model: {err}")
+            fallback_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+            target_model = next((m for m in fallback_models if m != target_model), "openai/gpt-oss-20b")
+        except (groq.RateLimitError, groq.APIConnectionError) as err:
+            retries += 1
+            if retries > max_retries:
+                logger.error(f"Groq call exceeded max retries ({max_retries}): {err}")
+                raise
+            sleep_time = backoff
+            if hasattr(err, "response") and err.response is not None:
+                retry_after = getattr(err.response, "headers", {}).get("retry-after")
+                if retry_after:
+                    try:
+                        sleep_time = max(float(retry_after), sleep_time)
+                    except (ValueError, TypeError):
+                        pass
+            # Bound single wait time to 15 seconds to ensure total wait time is strictly bounded
+            sleep_time = min(sleep_time, 15.0)
+            logger.warning(
+                f"Groq {type(err).__name__} (attempt {retries}/{max_retries}). Retrying in {sleep_time:.1f}s: {err}"
+            )
+            await asyncio.sleep(sleep_time)
+            backoff *= 1.5
 
 
 def parse_json_safely(raw_text: str, model: Type[T]) -> T:
