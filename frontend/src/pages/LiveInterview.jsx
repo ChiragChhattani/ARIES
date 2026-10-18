@@ -158,6 +158,7 @@ export default function LiveInterview() {
   const [socket, setSocket] = useState(null);
   const [error, setError] = useState(null);
   const [toast, setToast] = useState(null);
+  const [evaluationError, setEvaluationError] = useState(null);
   const [proctoringLog, setProctoringLog] = useState([]);
   const [showLog, setShowLog] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
@@ -495,10 +496,18 @@ export default function LiveInterview() {
 
   async function handleEvaluate() {
     setIsProcessing(true);
+    setEvaluationError(null);
     try {
       await evaluateInterview(id);
-    } catch {
-      alert("Error generating evaluation");
+      navigate(`/report/${id}`);
+    } catch (e) {
+      const errInfo = {
+        message: e.message || "Failed to generate evaluation.",
+        code: e.code || "SERVER_ERROR",
+        correlationId: e.correlationId || null
+      };
+      setEvaluationError(errInfo);
+      setToast(`⚠ Evaluation failed: ${errInfo.message}`);
       setIsProcessing(false);
     }
   }
@@ -732,7 +741,7 @@ export default function LiveInterview() {
           ))}
 
           {/* Typing indicator */}
-          {isProcessing && session.status !== "EVALUATING" && session.status !== "CONFIGURED" && session.status !== "CREATED" && (
+          {isProcessing && session.status !== "EVALUATING" && session.status !== "CONFIGURED" && session.status !== "CREATED" && session.status !== "COMPLETED" && (
             <div className="flex justify-start">
               <div className="bg-[#0E131F] border border-slate-800 rounded-2xl rounded-bl-sm px-5 py-3.5 shadow-md flex items-center space-x-2 text-violet-400">
                 <span className="w-2 h-2 rounded-full bg-violet-400 animate-bounce"></span>
@@ -743,7 +752,7 @@ export default function LiveInterview() {
           )}
 
           {/* Post-interview banner */}
-          {isCompleted && !isProcessing && (
+          {isCompleted && (
             <div className="text-center py-8 bg-[#0E131F]/60 border border-slate-800 rounded-2xl max-w-md mx-auto my-4 p-6 shadow-xl">
               <div className="w-10 h-10 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center mx-auto mb-3 text-emerald-400 text-lg">
                 ✓
@@ -752,12 +761,32 @@ export default function LiveInterview() {
               <p className="text-slate-400 text-xs mb-5">
                 The interview dialogue is complete. Click below to trigger the multi-agent competency evaluation.
               </p>
-              <button 
-                onClick={handleEvaluate} 
-                className="bg-gradient-to-r from-emerald-600 via-teal-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white px-7 py-3 rounded-xl font-semibold text-sm shadow-lg shadow-emerald-600/30 transition-all"
-              >
-                Generate Evaluation Report
-              </button>
+
+              {evaluationError && (
+                <div className="mb-5 p-3.5 rounded-xl border bg-rose-950/40 border-rose-800/60 text-rose-300 text-left text-xs">
+                  <p className="font-semibold uppercase tracking-wider text-[11px] mb-1">Evaluation Error</p>
+                  <p className="text-slate-200">{evaluationError.message}</p>
+                  {evaluationError.correlationId && (
+                    <p className="text-[10px] text-slate-400 font-mono mt-1">
+                      Reference ID: {evaluationError.correlationId}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {isProcessing ? (
+                <div className="flex flex-col items-center gap-2 text-cyan-400 py-2">
+                  <div className="w-7 h-7 rounded-full border-2 border-cyan-400 border-t-transparent animate-spin"></div>
+                  <p className="text-xs font-medium animate-pulse">Evaluating dialogue transcript and scoring competencies…</p>
+                </div>
+              ) : (
+                <button
+                  onClick={handleEvaluate}
+                  className="bg-gradient-to-r from-emerald-600 via-teal-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white px-7 py-3 rounded-xl font-semibold text-sm shadow-lg shadow-emerald-600/30 transition-all"
+                >
+                  {evaluationError ? "Retry Evaluation Report" : "Generate Evaluation Report"}
+                </button>
+              )}
             </div>
           )}
 

@@ -204,6 +204,11 @@ class InterviewOrchestrator:
         session = await self.repo.get_by_id(session_id)
         if not session:
             raise OrchestratorError(f"Session {session_id} not found")
+
+        # Idempotency: return existing evaluation report if already completed
+        if session.status == InterviewStatus.REPORT_READY and session.evaluation_report:
+            logger.info(f"Evaluation report already ready for session {session_id}. Returning cached report.")
+            return session.evaluation_report
             
         InterviewStateMachine.validate_transition(session.status, InterviewStatus.EVALUATING)
         session.status = InterviewStatus.EVALUATING
@@ -232,9 +237,9 @@ class InterviewOrchestrator:
             return report
             
         except Exception as e:
-            # Handle failure
-            logger.error(f"Evaluation failed: {e}")
-            InterviewStateMachine.validate_transition(session.status, InterviewStatus.FAILED)
-            session.status = InterviewStatus.FAILED
+            # Handle failure: preserve COMPLETED status so candidate or recruiter can retry evaluation
+            logger.error(f"Evaluation failed for session {session_id}: {e}")
+            InterviewStateMachine.validate_transition(session.status, InterviewStatus.COMPLETED)
+            session.status = InterviewStatus.COMPLETED
             await self.repo.save(session)
             raise

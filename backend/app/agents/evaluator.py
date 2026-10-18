@@ -73,6 +73,7 @@ class EvaluatorAgentAdapter:
                     user_message=task_prompt,
                     output_model=EvaluationReport,
                     temperature=0.0,
+                    max_tokens=3072,
                 )
             else:
                 result = await self._agent.run(task=task_prompt)

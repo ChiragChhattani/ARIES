@@ -206,3 +206,108 @@ def test_interviewer_prompt_followup_rule_targets_genuine_gaps(sample_job):
     assert "genuine evidence gap" in prompt
     assert "Do NOT ask a follow-up merely because follow-ups remain" in prompt
 
+
+@pytest.mark.asyncio
+async def test_groq_generate_retries_and_increases_tokens_on_json_validate_failed():
+    """groq_generate automatically retries and expands token limit on json_validate_failed."""
+    import groq
+    import httpx
+    from unittest.mock import MagicMock
+    from app.agents.base import groq_generate
+    from pydantic import BaseModel
+
+    class SimpleOutput(BaseModel):
+        result: str
+
+    response_mock = httpx.Response(
+        status_code=400,
+        request=httpx.Request("POST", "https://api.groq.com"),
+        json={"error": {"code": "json_validate_failed", "message": "max completion tokens reached"}}
+    )
+    bad_req = groq.BadRequestError(
+        message="max completion tokens reached before generating a valid document (json_validate_failed)",
+        response=response_mock,
+        body={"error": {"code": "json_validate_failed"}}
+    )
+
+    valid_completion = MagicMock()
+    valid_choice = MagicMock()
+    valid_choice.message.content = json.dumps({"result": "success"})
+    valid_completion.choices = [valid_choice]
+
+    mock_client = MagicMock()
+    # First call throws json_validate_failed, second call succeeds
+    mock_client.chat.completions.create = AsyncMock(side_effect=[bad_req, valid_completion])
+
+    with patch("app.agents.base.create_groq_client", return_value=mock_client), \
+         patch("asyncio.sleep", new_callable=AsyncMock):
+        res = await groq_generate(
+            system_prompt="sys",
+            user_message="usr",
+            output_model=SimpleOutput,
+            max_tokens=1024,
+            max_retries=2
+        )
+        assert res.result == "success"
+        assert mock_client.chat.completions.create.call_count == 2
+        # First call used 1024 tokens
+        assert mock_client.chat.completions.create.call_args_list[0].kwargs["max_tokens"] == 1024
+        # Second call increased max_tokens by 1024 -> 2048
+        assert mock_client.chat.completions.create.call_args_list[1].kwargs["max_tokens"] == 2048
+
+
+@pytest.mark.asyncio
+async def test_groq_generate_retries_on_malformed_json_output():
+    """groq_generate retries when LLM returns truncated or malformed JSON."""
+    from unittest.mock import MagicMock
+    from app.agents.base import groq_generate
+    from pydantic import BaseModel
+
+    class SimpleOutput(BaseModel):
+        result: str
+
+    bad_choice = MagicMock()
+    bad_choice.message.content = "not valid json {{"
+    bad_completion = MagicMock()
+    bad_completion.choices = [bad_choice]
+
+    good_choice = MagicMock()
+    good_choice.message.content = json.dumps({"result": "valid"})
+    good_completion = MagicMock()
+    good_completion.choices = [good_choice]
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = AsyncMock(side_effect=[bad_completion, good_completion])
+
+    with patch("app.agents.base.create_groq_client", return_value=mock_client), \
+         patch("asyncio.sleep", new_callable=AsyncMock):
+        res = await groq_generate(
+            system_prompt="sys",
+            user_message="usr",
+            output_model=SimpleOutput,
+            max_tokens=1024,
+            max_retries=2
+        )
+        assert res.result == "valid"
+        assert mock_client.chat.completions.create.call_count == 2
+
+
+@pytest.mark.asyncio
+@patch("app.agents.evaluator.is_groq", return_value=True)
+async def test_evaluator_adapter_uses_3072_max_tokens_for_groq(mock_is_groq, sample_job, sample_transcript):
+    """EvaluatorAgentAdapter explicitly passes max_tokens=3072 to groq_generate."""
+    from app.agents.evaluator import EvaluatorAgentAdapter
+    from app.schemas.agent_outputs import EvaluationReport
+
+    adapter = EvaluatorAgentAdapter(job=sample_job, rubric=get_default_rubric())
+
+    with patch("app.agents.evaluator.groq_generate", new_callable=AsyncMock) as mock_groq_gen:
+        mock_groq_gen.return_value = EvaluationReport(
+            competency_evaluations=[], strengths=[], areas_for_improvement=[], questions_for_human_reviewer=[]
+        )
+        await adapter.generate_evaluation(transcript=sample_transcript)
+
+        assert mock_groq_gen.call_count == 1
+        call_kwargs = mock_groq_gen.call_args.kwargs
+        assert call_kwargs["max_tokens"] == 3072
+        assert call_kwargs["output_model"] == EvaluationReport

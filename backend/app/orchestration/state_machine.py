@@ -31,10 +31,10 @@ class InterviewStateMachine:
         InterviewStatus.IN_PROGRESS: {InterviewStatus.PAUSED, InterviewStatus.COMPLETED, InterviewStatus.CANCELLED, InterviewStatus.FAILED},
         InterviewStatus.PAUSED: {InterviewStatus.IN_PROGRESS, InterviewStatus.CANCELLED, InterviewStatus.FAILED},
         InterviewStatus.COMPLETED: {InterviewStatus.EVALUATING, InterviewStatus.CANCELLED, InterviewStatus.FAILED},
-        InterviewStatus.EVALUATING: {InterviewStatus.REPORT_READY, InterviewStatus.FAILED},
+        InterviewStatus.EVALUATING: {InterviewStatus.EVALUATING, InterviewStatus.REPORT_READY, InterviewStatus.FAILED, InterviewStatus.COMPLETED},
         InterviewStatus.REPORT_READY: {InterviewStatus.FAILED}, # Terminal success state
         InterviewStatus.CANCELLED: set(), # Terminal state
-        InterviewStatus.FAILED: set(),    # Terminal state
+        InterviewStatus.FAILED: {InterviewStatus.EVALUATING},    # Allow retry of failed evaluation
     }
     
     @classmethod

@@ -20,7 +20,7 @@ to convert the raw JSON string Groq returns.
 
 import asyncio
 from typing import TypeVar, Type
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 import json
 
 from app.core.config import get_settings
@@ -120,7 +120,7 @@ async def groq_generate(
     settings = get_settings()
     client = create_groq_client()
     target_model = settings.groq_model or "openai/gpt-oss-120b"
-    token_limit = max_tokens if max_tokens is not None else min(settings.openai_max_tokens, 1024)
+    token_limit = max_tokens if max_tokens is not None else min(settings.openai_max_tokens, 2048)
 
     retries = 0
     backoff = 2.0
@@ -149,6 +149,27 @@ async def groq_generate(
             logger.warning(f"Groq model '{target_model}' not found. Falling back to alternative model: {err}")
             fallback_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
             target_model = next((m for m in fallback_models if m != target_model), "openai/gpt-oss-20b")
+        except groq.BadRequestError as err:
+            err_str = str(err)
+            if "json_validate_failed" in err_str and retries < max_retries:
+                retries += 1
+                token_limit = min(token_limit + 1024, settings.openai_max_tokens)
+                logger.warning(
+                    f"Groq JSON validation failed (likely token truncation). Increased max_tokens to {token_limit} and retrying ({retries}/{max_retries}): {err}"
+                )
+                await asyncio.sleep(1.0)
+                continue
+            logger.error(f"Groq BadRequestError: {err}")
+            raise
+        except (ValidationError, json.JSONDecodeError) as err:
+            retries += 1
+            if retries > max_retries:
+                logger.error(f"Malformed LLM output exceeded max retries ({max_retries}): {err}")
+                raise
+            logger.warning(
+                f"Malformed LLM output received (attempt {retries}/{max_retries}). Retrying generation: {err}"
+            )
+            await asyncio.sleep(1.0)
         except (groq.RateLimitError, groq.APIConnectionError) as err:
             retries += 1
             if retries > max_retries:

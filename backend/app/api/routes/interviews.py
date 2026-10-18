@@ -16,6 +16,7 @@ from sqlalchemy import select
 from app.observability.logging import get_logger, correlation_id_var
 logger = get_logger(__name__)
 
+from pydantic import ValidationError, BaseModel, Field
 from app.database.engine import get_db_session
 from app.database.models import InterviewRecord
 from app.schemas.interview import (
@@ -184,6 +185,14 @@ async def evaluate_interview(session_id: str, db: AsyncSession = Depends(get_db_
         corr_id = correlation_id_var.get()
         logger.error(f"AI Model Not Found in evaluate [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
         raise HTTPException(status_code=502, detail={"code": "AI_MODEL_NOT_FOUND", "message": "The configured AI model is not accessible or does not exist."})
+    except (groq.BadRequestError, openai.BadRequestError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Bad Request Error in evaluate [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
+        raise HTTPException(status_code=502, detail={"code": "AI_BAD_REQUEST", "message": "The AI service rejected the evaluation request. Please retry."})
+    except (ValidationError, json.JSONDecodeError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Invalid Output Error in evaluate [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
+        raise HTTPException(status_code=502, detail={"code": "AI_INVALID_OUTPUT", "message": "The AI service returned an incomplete or malformed evaluation report. Please retry."})
     except StateMachineError as e:
         corr_id = correlation_id_var.get()
         logger.error(f"State Machine Error in evaluate [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
@@ -198,7 +207,6 @@ async def evaluate_interview(session_id: str, db: AsyncSession = Depends(get_db_
         raise HTTPException(status_code=500, detail={"code": "SERVER_ERROR", "message": "The interview could not be evaluated. Please try again."})
 
 from app.schemas.interview import ProctoringEvent
-from pydantic import BaseModel, Field
 
 class AnswerSubmitRequest(BaseModel):
     answer: str = Field(..., description="Candidate's answer text")

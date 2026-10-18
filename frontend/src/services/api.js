@@ -89,8 +89,8 @@ export async function startInterview(sessionId) {
     const errorData = await res.json().catch(() => null);
     throw {
       status: res.status,
-      code: errorData?.error?.code || 'UNKNOWN_ERROR',
-      message: errorData?.error?.message || 'Failed to start interview'
+      code: errorData?.detail?.code || 'UNKNOWN_ERROR',
+      message: errorData?.detail?.message || 'Failed to start interview'
     };
   }
   return res.json();
@@ -99,8 +99,15 @@ export async function startInterview(sessionId) {
 export async function evaluateInterview(sessionId) {
   const res = await fetch(`${API_BASE}/interviews/${sessionId}/evaluate`, { method: "POST" });
   if (!res.ok) {
-    const errorBody = await res.text().catch(() => "");
-    throw new Error(`Failed to evaluate interview (${res.status}): ${errorBody}`);
+    const errorData = await res.json().catch(() => null);
+    const correlationId = res.headers.get("x-correlation-id") || errorData?.correlation_id;
+    const message = errorData?.detail?.message || errorData?.detail || `Failed to evaluate interview (${res.status})`;
+    const code = errorData?.detail?.code || "EVALUATION_ERROR";
+    const err = new Error(message);
+    err.status = res.status;
+    err.code = code;
+    err.correlationId = correlationId;
+    throw err;
   }
   return res.json();
 }

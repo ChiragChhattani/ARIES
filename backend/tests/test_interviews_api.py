@@ -433,3 +433,185 @@ class TestInterviewsApi:
         assert dup_res.json()["questions_asked"] == 2
         assert len(dup_res.json()["transcript"]) == 3
         assert dup_res.json()["transcript"][-1]["content"] == "Q2: What is asyncio?"
+
+    def _create_completed_session(self, test_client, monkeypatch):
+        """Helper to create a session and advance it through questions to COMPLETED."""
+        res = test_client.post("/api/v1/interviews", json={
+            "job_description": {
+                "field": "software_engineering",
+                "custom_field_name": "",
+                "title": "Backend Dev",
+                "description": "A" * 60,
+                "competencies": [{"name": "Python", "description": "Python knowledge"}]
+            },
+            "settings": {"max_questions": 3}
+        })
+        session_id = res.json()["session_id"]
+        from app.schemas.agent_outputs import NextQuestion
+        from unittest.mock import AsyncMock
+
+        mock_q = NextQuestion(
+            question_text="Q: Tell me about your experience.",
+            rationale="R", competency_targeted="Python", is_followup=False,
+            expected_good_answer_elements=["basics"]
+        )
+        monkeypatch.setattr(
+            "app.agents.interviewer.InterviewerAgentAdapter.generate_next_question",
+            AsyncMock(return_value=mock_q)
+        )
+        test_client.post(f"/api/v1/interviews/{session_id}/start")
+        test_client.post(f"/api/v1/interviews/{session_id}/answer", json={"answer": "Ans 1"})
+        test_client.post(f"/api/v1/interviews/{session_id}/answer", json={"answer": "Ans 2"})
+        last_res = test_client.post(f"/api/v1/interviews/{session_id}/answer", json={"answer": "Ans 3"})
+        assert last_res.json()["status"] == "COMPLETED"
+        return session_id
+
+    def test_evaluate_interview_success(self, test_client, monkeypatch):
+        """Evaluating a completed interview returns 200 and transitions to REPORT_READY."""
+        session_id = self._create_completed_session(test_client, monkeypatch)
+
+        from app.schemas.agent_outputs import EvaluationReport, CompetencyEvaluation
+        from unittest.mock import AsyncMock
+
+        mock_report = EvaluationReport(
+            competency_evaluations=[
+                CompetencyEvaluation(
+                    competency_name="Python",
+                    score=4,
+                    rationale="Demonstrated solid comprehension.",
+                    evidence_excerpts=['Candidate: "Ans 1"'],
+                    missing_evidence=""
+                )
+            ],
+            strengths=["Consistent Python answers."],
+            areas_for_improvement=["Could elaborate on system design."],
+            questions_for_human_reviewer=["Ask about GIL architecture."]
+        )
+        monkeypatch.setattr(
+            "app.agents.evaluator.EvaluatorAgentAdapter.generate_evaluation",
+            AsyncMock(return_value=mock_report)
+        )
+
+        res = test_client.post(f"/api/v1/interviews/{session_id}/evaluate")
+        assert res.status_code == 200
+        data = res.json()
+        assert len(data["competency_evaluations"]) == 1
+        assert data["competency_evaluations"][0]["competency_name"] == "Python"
+        assert data["competency_evaluations"][0]["score"] == 4
+
+        # Verify session state in backend
+        session_res = test_client.get(f"/api/v1/interviews/{session_id}")
+        assert session_res.json()["status"] == "REPORT_READY"
+
+    def test_evaluate_interview_repeated_requests_idempotent(self, test_client, monkeypatch):
+        """Subsequent evaluate calls return cached report without re-running evaluation agent."""
+        session_id = self._create_completed_session(test_client, monkeypatch)
+
+        from app.schemas.agent_outputs import EvaluationReport, CompetencyEvaluation
+        from unittest.mock import AsyncMock
+
+        mock_report = EvaluationReport(
+            competency_evaluations=[
+                CompetencyEvaluation(
+                    competency_name="Python",
+                    score=5,
+                    rationale="Flawless answers.",
+                    evidence_excerpts=[],
+                    missing_evidence=""
+                )
+            ],
+            strengths=["Python master"],
+            areas_for_improvement=[],
+            questions_for_human_reviewer=[]
+        )
+        mock_eval = AsyncMock(return_value=mock_report)
+        monkeypatch.setattr(
+            "app.agents.evaluator.EvaluatorAgentAdapter.generate_evaluation",
+            mock_eval
+        )
+
+        first_res = test_client.post(f"/api/v1/interviews/{session_id}/evaluate")
+        assert first_res.status_code == 200
+        assert mock_eval.call_count == 1
+
+        # Second evaluate call
+        second_res = test_client.post(f"/api/v1/interviews/{session_id}/evaluate")
+        assert second_res.status_code == 200
+        assert second_res.json()["competency_evaluations"][0]["score"] == 5
+        # Must NOT have called the evaluator agent again
+        assert mock_eval.call_count == 1
+
+    def test_evaluate_interview_groq_api_failure_preserves_completed_status(self, test_client, monkeypatch):
+        """Groq API failure returns 503 and leaves session in COMPLETED so it can be retried."""
+        session_id = self._create_completed_session(test_client, monkeypatch)
+
+        import httpx
+        import groq
+        from unittest.mock import AsyncMock
+
+        req = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+        mock_eval = AsyncMock(side_effect=groq.APIConnectionError(request=req))
+        monkeypatch.setattr(
+            "app.agents.evaluator.EvaluatorAgentAdapter.generate_evaluation",
+            mock_eval
+        )
+
+        err_res = test_client.post(f"/api/v1/interviews/{session_id}/evaluate")
+        assert err_res.status_code == 503
+        assert err_res.json()["detail"]["code"] == "AI_UNAVAILABLE"
+
+        # Crucial check: session must NOT be bricked into FAILED; it must remain COMPLETED for retry
+        session_res = test_client.get(f"/api/v1/interviews/{session_id}")
+        assert session_res.json()["status"] == "COMPLETED"
+
+        # Now simulate a retry succeeding
+        from app.schemas.agent_outputs import EvaluationReport, CompetencyEvaluation
+        mock_eval.side_effect = None
+        mock_eval.return_value = EvaluationReport(
+            competency_evaluations=[
+                CompetencyEvaluation(
+                    competency_name="Python", score=4, rationale="Good", evidence_excerpts=[]
+                )
+            ]
+        )
+        retry_res = test_client.post(f"/api/v1/interviews/{session_id}/evaluate")
+        assert retry_res.status_code == 200
+        assert test_client.get(f"/api/v1/interviews/{session_id}").json()["status"] == "REPORT_READY"
+
+    def test_evaluate_interview_malformed_model_output(self, test_client, monkeypatch):
+        """Malformed LLM JSON output returns 502 AI_INVALID_OUTPUT and preserves COMPLETED."""
+        session_id = self._create_completed_session(test_client, monkeypatch)
+
+        import json
+        from unittest.mock import AsyncMock
+
+        mock_eval = AsyncMock(side_effect=json.JSONDecodeError("Invalid JSON from LLM", "", 0))
+        monkeypatch.setattr(
+            "app.agents.evaluator.EvaluatorAgentAdapter.generate_evaluation",
+            mock_eval
+        )
+
+        res = test_client.post(f"/api/v1/interviews/{session_id}/evaluate")
+        assert res.status_code == 502
+        assert res.json()["detail"]["code"] == "AI_INVALID_OUTPUT"
+
+        # Session remains COMPLETED
+        session_res = test_client.get(f"/api/v1/interviews/{session_id}")
+        assert session_res.json()["status"] == "COMPLETED"
+
+    def test_evaluate_interview_invalid_state(self, test_client):
+        """Calling evaluate on a session that has not reached COMPLETED returns 400 INVALID_STATE."""
+        res = test_client.post("/api/v1/interviews", json={
+            "job_description": {
+                "field": "software_engineering",
+                "custom_field_name": "",
+                "title": "Backend Dev",
+                "description": "A" * 60,
+                "competencies": [{"name": "Python", "description": "Python knowledge"}]
+            }
+        })
+        session_id = res.json()["session_id"]
+        # Session is CONFIGURED, not COMPLETED
+        eval_res = test_client.post(f"/api/v1/interviews/{session_id}/evaluate")
+        assert eval_res.status_code == 400
+        assert eval_res.json()["detail"]["code"] == "INVALID_STATE"

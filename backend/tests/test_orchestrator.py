@@ -632,3 +632,72 @@ async def test_consecutive_candidate_answers_rejected(db_session, create_request
     # Submitting another answer while speaker is still candidate should be blocked
     with pytest.raises(StateMachineError, match="already been submitted"):
         await orchestrator.handle_candidate_answer(session.session_id, "Second answer")
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_evaluate_retry_preserves_completed(db_session, create_request):
+    """When evaluation agent throws, orchestrator reverts status to COMPLETED so it can be retried."""
+    orchestrator = InterviewOrchestrator(db_session)
+    session = await orchestrator.create_interview(create_request)
+    session.status = InterviewStatus.COMPLETED
+    session.transcript.append(
+        TranscriptEntry(speaker="interviewer", content="Question 1")
+    )
+    session.transcript.append(
+        TranscriptEntry(speaker="candidate", content="Answer 1")
+    )
+    await orchestrator.repo.save(session)
+
+    # First attempt fails with an exception
+    with patch('app.agents.evaluator.EvaluatorAgentAdapter.generate_evaluation', new_callable=AsyncMock) as mock_eval:
+        mock_eval.side_effect = RuntimeError("Evaluation LLM timeout")
+
+        with pytest.raises(RuntimeError, match="Evaluation LLM timeout"):
+            await orchestrator.evaluate_interview(session.session_id)
+
+        # Status must have reverted to COMPLETED rather than permanently FAILED
+        reloaded = await orchestrator.repo.get_by_id(session.session_id)
+        assert reloaded.status == InterviewStatus.COMPLETED
+
+    # Second attempt succeeds
+    mock_report = EvaluationReport(
+        competency_evaluations=[
+            CompetencyEvaluation(
+                competency_name="Python", score=5, rationale="Great",
+                evidence_excerpts=["Answer 1"], missing_evidence=""
+            )
+        ],
+        strengths=["Solid knowledge"], areas_for_improvement=[], questions_for_human_reviewer=[]
+    )
+    with patch('app.agents.evaluator.EvaluatorAgentAdapter.generate_evaluation', new_callable=AsyncMock) as mock_eval:
+        mock_eval.return_value = mock_report
+        report = await orchestrator.evaluate_interview(session.session_id)
+        assert report.competency_evaluations[0].score == 5
+
+        final = await orchestrator.repo.get_by_id(session.session_id)
+        assert final.status == InterviewStatus.REPORT_READY
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_evaluate_idempotency_returns_cached_report(db_session, create_request):
+    """Calling evaluate on a session that is already REPORT_READY returns cached report without re-evaluating."""
+    orchestrator = InterviewOrchestrator(db_session)
+    session = await orchestrator.create_interview(create_request)
+
+    existing_report = EvaluationReport(
+        competency_evaluations=[
+            CompetencyEvaluation(
+                competency_name="Python", score=4, rationale="Cached",
+                evidence_excerpts=[], missing_evidence=""
+            )
+        ]
+    )
+    session.status = InterviewStatus.REPORT_READY
+    session.evaluation_report = existing_report
+    await orchestrator.repo.save(session)
+
+    with patch('app.agents.evaluator.EvaluatorAgentAdapter.generate_evaluation', new_callable=AsyncMock) as mock_eval:
+        report = await orchestrator.evaluate_interview(session.session_id)
+        assert report.competency_evaluations[0].score == 4
+        # Agent should not have been called
+        assert mock_eval.call_count == 0
