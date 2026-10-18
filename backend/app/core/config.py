@@ -73,7 +73,7 @@ class Settings(BaseSettings):
         default="",
         description="Groq API key. Read from GROQ_API_KEY env var.",
     )
-    groq_model: str = "llama-3.3-70b-versatile"
+    groq_model: str = "openai/gpt-oss-120b"
 
     # --- Interview Defaults ---
     default_max_questions: int = Field(default=10, ge=3, le=50)

@@ -7,12 +7,14 @@ Exposes CRUD and action endpoints for the Orchestrator.
 import json
 import logging
 import openai
+import groq
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-logger = logging.getLogger(__name__)
+from app.observability.logging import get_logger, correlation_id_var
+logger = get_logger(__name__)
 
 from app.database.engine import get_db_session
 from app.database.models import InterviewRecord
@@ -110,23 +112,41 @@ async def start_interview(session_id: str, db: AsyncSession = Depends(get_db_ses
         await manager.send_event(session_id, WebSocketEventType.STATUS_UPDATED, {"status": session.status})
         
         return _to_response(session)
-    except openai.AuthenticationError as e:
-        logger.exception("AI Authentication Error")
+    except (openai.AuthenticationError, groq.AuthenticationError, groq.PermissionDeniedError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Authentication Error [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
         raise HTTPException(status_code=503, detail={"code": "AI_NOT_CONFIGURED", "message": "The AI service is not configured. Please check the server configuration."})
-    except openai.APITimeoutError as e:
-        logger.exception("AI Timeout Error")
+    except (openai.APITimeoutError, groq.APITimeoutError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Timeout Error [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
         raise HTTPException(status_code=504, detail={"code": "AI_TIMEOUT", "message": "The AI took too long to respond. Please try again."})
-    except openai.RateLimitError as e:
-        logger.exception("AI Rate Limit Error")
+    except (openai.RateLimitError, groq.RateLimitError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Rate Limit Error [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
         raise HTTPException(status_code=429, detail={"code": "AI_RATE_LIMIT", "message": "AI rate limit exceeded. Please try again shortly."})
+    except (groq.APIConnectionError, openai.APIConnectionError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Connection Error [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
+        raise HTTPException(status_code=503, detail={"code": "AI_UNAVAILABLE", "message": "Unable to connect to AI service. Please check network/service availability."})
+    except (groq.NotFoundError, openai.NotFoundError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Model Not Found [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
+        raise HTTPException(status_code=502, detail={"code": "AI_MODEL_NOT_FOUND", "message": "The configured AI model is not accessible or does not exist."})
+    except (groq.BadRequestError, openai.BadRequestError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Bad Request [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
+        raise HTTPException(status_code=400, detail={"code": "AI_BAD_REQUEST", "message": "Invalid request sent to AI service."})
     except StateMachineError as e:
-        logger.exception("State Machine Error")
+        corr_id = correlation_id_var.get()
+        logger.error(f"State Machine Error [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
         raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": str(e)})
     except OrchestratorError as e:
-        logger.exception("Orchestrator Error")
+        corr_id = correlation_id_var.get()
+        logger.error(f"Orchestrator Error [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
         raise HTTPException(status_code=404, detail={"code": "SESSION_NOT_FOUND", "message": "This interview session does not exist or has expired."})
     except Exception as e:
-        logger.exception("Server Error")
+        corr_id = correlation_id_var.get()
+        logger.error(f"Server Error starting interview {session_id} [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
         raise HTTPException(status_code=500, detail={"code": "SERVER_ERROR", "message": "The interview could not be started. Please try again."})
 
 @router.post("/{session_id}/evaluate", response_model=EvaluationReport)
@@ -144,10 +164,38 @@ async def evaluate_interview(session_id: str, db: AsyncSession = Depends(get_db_
         await manager.send_event(session_id, WebSocketEventType.STATUS_UPDATED, {"status": "REPORT_READY"})
         
         return report
+    except (openai.AuthenticationError, groq.AuthenticationError, groq.PermissionDeniedError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Authentication Error in evaluate [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
+        raise HTTPException(status_code=503, detail={"code": "AI_NOT_CONFIGURED", "message": "The AI service is not configured. Please check the server configuration."})
+    except (openai.APITimeoutError, groq.APITimeoutError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Timeout Error in evaluate [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
+        raise HTTPException(status_code=504, detail={"code": "AI_TIMEOUT", "message": "The AI took too long to evaluate. Please try again."})
+    except (openai.RateLimitError, groq.RateLimitError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Rate Limit Error in evaluate [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
+        raise HTTPException(status_code=429, detail={"code": "AI_RATE_LIMIT", "message": "AI rate limit exceeded. Please try again shortly."})
+    except (groq.APIConnectionError, openai.APIConnectionError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Connection Error in evaluate [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
+        raise HTTPException(status_code=503, detail={"code": "AI_UNAVAILABLE", "message": "Unable to connect to AI service. Please check network/service availability."})
+    except (groq.NotFoundError, openai.NotFoundError) as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"AI Model Not Found in evaluate [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
+        raise HTTPException(status_code=502, detail={"code": "AI_MODEL_NOT_FOUND", "message": "The configured AI model is not accessible or does not exist."})
     except StateMachineError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        corr_id = correlation_id_var.get()
+        logger.error(f"State Machine Error in evaluate [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
+        raise HTTPException(status_code=400, detail={"code": "INVALID_STATE", "message": str(e)})
     except OrchestratorError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        corr_id = correlation_id_var.get()
+        logger.error(f"Orchestrator Error in evaluate [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
+        raise HTTPException(status_code=404, detail={"code": "SESSION_NOT_FOUND", "message": str(e)})
+    except Exception as e:
+        corr_id = correlation_id_var.get()
+        logger.error(f"Server Error evaluating interview {session_id} [correlation_id={corr_id}]: {e}", exc_info=True, extra={"session_id": session_id, "correlation_id": corr_id, "error_type": type(e).__name__})
+        raise HTTPException(status_code=500, detail={"code": "SERVER_ERROR", "message": "The interview could not be evaluated. Please try again."})
 
 from app.schemas.interview import ProctoringEvent
 

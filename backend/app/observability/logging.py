@@ -61,7 +61,11 @@ class StructuredFormatter(logging.Formatter):
     }
 
     # Fields that must NEVER appear in logs (redacted if present)
-    SENSITIVE_FIELDS = {"api_key", "openai_api_key", "password", "token", "secret"}
+    SENSITIVE_FIELDS = {"api_key", "openai_api_key", "groq_api_key", "password", "token", "secret", "authorization"}
+
+    def _is_sensitive(self, key: str) -> bool:
+        low = key.lower()
+        return low in self.SENSITIVE_FIELDS or "api_key" in low or "secret" in low or "token" in low or "password" in low
 
     def format(self, record: logging.LogRecord) -> str:
         """Format a log record as a JSON string."""
@@ -78,7 +82,7 @@ class StructuredFormatter(logging.Formatter):
         for key, value in record.__dict__.items():
             if key not in self.RESERVED_ATTRS and not key.startswith("_"):
                 # Redact sensitive fields
-                if key.lower() in self.SENSITIVE_FIELDS:
+                if self._is_sensitive(key):
                     log_entry[key] = "***REDACTED***"
                 else:
                     log_entry[key] = value

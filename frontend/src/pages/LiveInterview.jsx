@@ -13,6 +13,8 @@ function mapErrorToMessage(err) {
     case "AI_NOT_CONFIGURED": return { type: "error", text: "The AI service is not configured. Please ask the administrator to set up the API key on the server." };
     case "AI_TIMEOUT": return { type: "warning", text: "The AI is taking too long to respond. Please try again." };
     case "AI_RATE_LIMIT": return { type: "warning", text: "Too many requests to the AI service. Please wait a moment and try again." };
+    case "AI_UNAVAILABLE": return { type: "error", text: "Unable to connect to the AI service. Please check network connectivity or try again shortly." };
+    case "AI_MODEL_NOT_FOUND": return { type: "error", text: "The configured AI model is not accessible. Please check server model configuration." };
     case "SESSION_NOT_FOUND": return { type: "error", text: "This interview session is invalid or has expired." };
     case "INVALID_STATE": return { type: "warning", text: err.message || "This action cannot be performed in the current interview state." };
     default: return { type: "error", text: "The interview could not be started. Please refresh and try again." };

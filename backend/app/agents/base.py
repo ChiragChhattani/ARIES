@@ -79,9 +79,16 @@ def create_groq_client():
     Creates an `AsyncGroq` client using the groq SDK.
     The groq SDK is pure Python and does NOT require jiter or openai.
     """
-    from groq import AsyncGroq
+    import groq
     settings = get_settings()
-    return AsyncGroq(api_key=settings.groq_api_key)
+    api_key = settings.groq_api_key.strip() if settings.groq_api_key else ""
+    if not api_key:
+        raise groq.AuthenticationError(
+            message="GROQ_API_KEY is not configured on the server. Please set GROQ_API_KEY in environment variables.",
+            response=None,
+            body=None,
+        )
+    return groq.AsyncGroq(api_key=api_key)
 
 
 async def groq_generate(
@@ -102,19 +109,36 @@ async def groq_generate(
     Returns:
         A validated instance of `output_model`.
     """
+    import groq
     settings = get_settings()
     client = create_groq_client()
+    target_model = settings.groq_model or "openai/gpt-oss-120b"
 
-    response = await client.chat.completions.create(
-        model=settings.groq_model or "openai/gpt-oss-20b",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        response_format={"type": "json_object"},
-        temperature=temperature,
-        max_tokens=settings.openai_max_tokens,
-    )
+    try:
+        response = await client.chat.completions.create(
+            model=target_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            response_format={"type": "json_object"},
+            temperature=temperature,
+            max_tokens=settings.openai_max_tokens,
+        )
+    except groq.NotFoundError as err:
+        logger.warning(f"Groq model '{target_model}' not found. Falling back to alternative model: {err}")
+        fallback_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+        fallback_model = next((m for m in fallback_models if m != target_model), "openai/gpt-oss-20b")
+        response = await client.chat.completions.create(
+            model=fallback_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            response_format={"type": "json_object"},
+            temperature=temperature,
+            max_tokens=settings.openai_max_tokens,
+        )
 
     raw = response.choices[0].message.content
     logger.debug(f"Groq raw response (first 300 chars): {raw[:300]}")

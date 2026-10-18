@@ -21,6 +21,8 @@ services:
         value: production
       - key: ARIES_LLM_PROVIDER
         value: groq
+      - key: ARIES_GROQ_MODEL
+        value: "openai/gpt-oss-120b"
       # Ephemeral SQLite storage for free-tier testing.
       # NOTE: Free tier instances spin down after 15 min of inactivity, so local SQLite
       # data will reset on spin-down or redeploy. For persistent data on the free tier,
