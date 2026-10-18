@@ -1,5 +1,13 @@
 // src/services/socket.js
 // Manages the WebSocket connection for a live interview.
+import { getApiBase } from "./api.js";
+
+export function getWsBase(rawUrl) {
+  const apiBase = getApiBase(rawUrl);
+  return apiBase.startsWith("https://")
+    ? apiBase.replace(/^https:\/\//, "wss://")
+    : apiBase.replace(/^http:\/\//, "ws://");
+}
 
 export class InterviewSocket {
   constructor(sessionId, onEvent) {
@@ -9,12 +17,7 @@ export class InterviewSocket {
   }
 
   connect() {
-    const rawApiUrl = import.meta.env.VITE_API_URL || "http://localhost:8000/api/v1";
-    const apiBase = rawApiUrl.replace(/\/+$/, "");
-    const wsBase = apiBase.startsWith("https://")
-      ? apiBase.replace(/^https:\/\//, "wss://")
-      : apiBase.replace(/^http:\/\//, "ws://");
-    
+    const wsBase = getWsBase();
     this.ws = new WebSocket(`${wsBase}/interviews/ws/${this.sessionId}`);
     
     this.ws.onmessage = (event) => {

@@ -46,7 +46,7 @@ services:
     staticPublishPath: dist
     envVars:
       - key: VITE_API_URL
-        value: "https://aries-backend.onrender.com/api/v1"
+        value: "https://aries-backend-8ydf.onrender.com/api/v1"
     
     # SPA rewrite rule so direct route links (/interview/:id, /report/:id) serve index.html
     routes:
